@@ -1257,6 +1257,7 @@
           </div>
           <div class="mobile-actions">
             <button id="mobileInfoBtn">Info</button>
+            <button id="mobileUndoBtn">Undo</button>
             <button id="mobileEndBtn">End Turn</button>
           </div>
         </div>
@@ -1288,6 +1289,7 @@
           <div class="secret-copy">Hold Mount Praetorous for 7 of your turns to win.</div>
         </div>
         <div class="actions">
+          <button id="undoBtn">Undo Deploy</button>
           <button id="endBtn">End Turn</button>
           <button id="soundBtn">Sound On</button>
           <button id="newBtn">New Match</button>
@@ -1735,6 +1737,8 @@
       paxDeployUsed: 0,
       paxFortifyUsed: 0,
       archonTurnFlags: [],
+      deployHistory: [],
+      initialAdvanceTimer: null,
       resultDismissed: false,
       lastToast: 0,
       uiTab: "intel",
@@ -1780,12 +1784,14 @@
     const soundCache = {};
     const mobileInfoBtn = document.querySelector("#mobileInfoBtn");
     const mobileEndBtn = document.querySelector("#mobileEndBtn");
+    const mobileUndoBtn = document.querySelector("#mobileUndoBtn");
     applySavedLayout();
     ensureMapBoard();
     primeSoundAssets();
 
     document.querySelector("#startBtn").addEventListener("click", startGame);
     document.querySelector("#newBtn").addEventListener("click", openSetup);
+    document.querySelector("#undoBtn").addEventListener("click", undoDeploy);
     document.querySelector("#endBtn").addEventListener("click", endTurn);
     document.querySelector("#soundBtn").addEventListener("click", toggleSound);
     document.querySelector("#panelCloseBtn").addEventListener("click", () => setMobilePanel(false));
@@ -1798,6 +1804,7 @@
     });
     document.querySelector("#resultNewBtn").addEventListener("click", openSetup);
     mobileInfoBtn.addEventListener("click", () => setMobilePanel(!state.mobilePanelOpen));
+    mobileUndoBtn.addEventListener("click", undoDeploy);
     mobileEndBtn.addEventListener("click", endTurn);
     document.querySelectorAll(".tab-btn").forEach(button => {
       button.addEventListener("click", () => setInfoTab(button.dataset.tab));
@@ -2174,6 +2181,11 @@
       state.paxDeployUsed = 0;
       state.paxFortifyUsed = 0;
       state.archonTurnFlags = state.players.map(() => ({}));
+      state.deployHistory = [];
+      if (state.initialAdvanceTimer) {
+        clearTimeout(state.initialAdvanceTimer);
+        state.initialAdvanceTimer = null;
+      }
       state.resultDismissed = false;
       state.selected = null;
       state.hovered = null;
@@ -2229,6 +2241,7 @@
     }
 
     function beginClaimDraft() {
+      state.deployHistory = [];
       if (!state.setupClaimOrder.length || state.setupClaimIndex >= state.setupClaimOrder.length) {
         state.current = 0;
         beginInitialPlacement();
@@ -2277,6 +2290,7 @@
     }
 
     function beginInitialPlacement() {
+      state.deployHistory = [];
       state.selected = null;
       state.phase = "initial";
       state.pending = state.setupRemaining[state.current] || 0;
@@ -2296,6 +2310,11 @@
     }
 
     function advanceInitialPlacement() {
+      if (state.initialAdvanceTimer) {
+        clearTimeout(state.initialAdvanceTimer);
+        state.initialAdvanceTimer = null;
+      }
+      state.deployHistory = [];
       state.setupRemaining[state.current] = state.pending;
       if (state.setupRemaining.every(count => count <= 0)) {
         state.current = 0;
@@ -2332,6 +2351,7 @@
       state.paxDeployUsed = 0;
       state.paxFortifyUsed = 0;
       state.archonTurnFlags[state.current] = {};
+      state.deployHistory = [];
       state.selected = null;
       state.phase = "reinforce";
       addLog(`${currentPlayer().name} gains ${reinforcement.total} reinforcements: ${reinforcement.summary}.`);
@@ -2377,6 +2397,7 @@
     }
 
     function nextPlayer() {
+      state.deployHistory = [];
       state.pendingBattle = null;
       checkEliminations();
       if (checkWinner()) return;
@@ -2464,7 +2485,7 @@
         if (!deployArmyTo(id)) return;
         if (state.pending === 0) {
           addLog(`${currentPlayer().name} finishes initial deployment.`);
-          setTimeout(advanceInitialPlacement, 180);
+          scheduleAdvanceInitialPlacement();
         }
         return;
       }
@@ -2475,12 +2496,56 @@
       if (state.phase === "action") return handleAction(id);
     }
 
+    function canUndoDeploy() {
+      if (!currentPlayer() || currentPlayer().type !== "human" || state.winner !== null) return false;
+      if (state.pendingBattle) return false;
+      const last = state.deployHistory[state.deployHistory.length - 1];
+      if (!last || last.player !== state.current) return false;
+      if (last.phaseBefore === "initial") return state.phase === "initial";
+      return state.phase === "reinforce" || state.phase === "action";
+    }
+
+    function undoDeploy() {
+      if (!canUndoDeploy()) {
+        addLog("There is no deployment to undo right now.");
+        return false;
+      }
+      const last = state.deployHistory.pop();
+      if (!last || state.armies[last.id] <= 0) return false;
+      if (state.initialAdvanceTimer) {
+        clearTimeout(state.initialAdvanceTimer);
+        state.initialAdvanceTimer = null;
+      }
+      state.armies[last.id]--;
+      if (last.phaseBefore === "initial" && state.armies[last.id] <= 0) {
+        state.armies[last.id] = 1;
+      }
+      state.phase = last.phaseBefore;
+      state.pending = last.pendingBefore;
+      state.paxDeployUsed = last.paxDeployUsedBefore;
+      state.selected = null;
+      if (last.phaseBefore === "initial") {
+        state.setupRemaining[state.current] = last.pendingBefore;
+      }
+      playSound("select");
+      addLog(`${currentPlayer().name} undoes the deployment at ${byId[last.id].name}.`);
+      render();
+      return true;
+    }
+
     function deployArmyTo(id) {
       if (!canDeployTo(id)) return false;
       if (areaSpareCapacity(id) <= 0) {
         addLog(`${byId[id].name} has reached its army cap of ${areaArmyCap(id)}.`);
         return false;
       }
+      state.deployHistory.push({
+        id,
+        player: state.current,
+        phaseBefore: state.phase,
+        pendingBefore: state.pending,
+        paxDeployUsedBefore: state.paxDeployUsed
+      });
       state.selected = id;
       state.armies[id]++;
       state.pending--;
@@ -2497,7 +2562,16 @@
       return true;
     }
 
+    function scheduleAdvanceInitialPlacement() {
+      if (state.initialAdvanceTimer) clearTimeout(state.initialAdvanceTimer);
+      state.initialAdvanceTimer = setTimeout(() => {
+        state.initialAdvanceTimer = null;
+        advanceInitialPlacement();
+      }, 260);
+    }
+
     function handleAction(id) {
+      state.deployHistory = [];
       if (state.pendingBattle) {
         addLog("Resolve or cancel the current battle first.");
         return;
@@ -3094,7 +3168,10 @@
 
       const humanTurn = player.type === "human" && state.winner === null;
       const setupFlow = state.phase === "draft" || state.phase === "initial";
+      const canUndo = canUndoDeploy();
+      document.querySelector("#undoBtn").disabled = !canUndo;
       document.querySelector("#endBtn").disabled = !humanTurn || setupFlow || state.pending > 0;
+      mobileUndoBtn.disabled = !canUndo;
       mobileEndBtn.disabled = !humanTurn || setupFlow || state.pending > 0;
       mobilePhase.textContent = currentPhaseName;
       mobileStatus.textContent = state.winner !== null
@@ -3191,11 +3268,13 @@
       if (state.phase === "draft" && currentPlayer().type === "ai") return "AI commander is claiming a starting area in the snake draft.";
       if (state.phase === "draft") return "Claim Stage: choose one unclaimed land area. The draft order snakes back and forth each round for a fairer opening.";
       if (state.phase === "initial" && currentPlayer().type === "ai") return "AI commander is placing opening reinforcements.";
-      if (state.phase === "initial") return "Initial Deploy Stage: place your opening reinforcements on areas you already control. The first campaign turn begins after all commanders finish setup.";
+      if (state.phase === "initial") return canUndoDeploy()
+        ? "Initial Deploy Stage: place your opening reinforcements on areas you already control. Use Undo if you misclick before setup advances."
+        : "Initial Deploy Stage: place your opening reinforcements on areas you already control. The first campaign turn begins after all commanders finish setup.";
       if (currentPlayer().type === "ai") return "AI commander is resolving its turn.";
       if (state.phase === "reinforce") return currentModeRules().paxDeployLimit === 1
-        ? "Deploy Stage: place all reinforcements onto your glowing occupied areas. In Bjangles Mode, Mount Praetorous only accepts 1 direct reinforcement each turn."
-        : "Deploy Stage: place all reinforcements onto your glowing occupied areas. After that, actions begin automatically.";
+        ? `Deploy Stage: place all reinforcements onto your glowing occupied areas.${canUndoDeploy() ? " Undo is available for your most recent placement." : ""} In Bjangles Mode, Mount Praetorous only accepts 1 direct reinforcement each turn.`
+        : `Deploy Stage: place all reinforcements onto your glowing occupied areas.${canUndoDeploy() ? " Undo is available for your most recent placement." : ""} After that, actions begin automatically.`;
       if (state.phase === "action") return currentModeRules().paxFortifyLimit === 1
         ? `Click one of your areas with 2+ armies. Then choose a connected target: friendly shifts troops, empty expands control, enemy triggers an attack. In Bjangles Mode, Mount Praetorous only accepts 1 friendly fortify move each turn, that move can bring at most ${paxFortifyArmyCap()} armies, and only ${paxCaptureLimit()} armies may enter when it is taken.`
         : `Click one of your areas with 2+ armies. Then choose a connected target: friendly shifts troops, empty expands control, enemy triggers an attack. Mount Praetorous allows at most ${paxCaptureLimit()} armies to enter when it is taken.`;
